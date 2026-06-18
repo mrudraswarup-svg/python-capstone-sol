@@ -28,7 +28,6 @@ from tests.conftest import (
 )
 
 
-@pytest.mark.skip(reason="Day-3 evening acceptance gate — remove this skip when ready.")
 class TestEndToEndScenario:
     def test_full_lifecycle(self, repos):
         # 1. Seed a customer + plan + active subscription
