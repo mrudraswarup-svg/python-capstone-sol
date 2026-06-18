@@ -22,31 +22,46 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from datetime import date, datetime
 
-from billing_engine.models import Invoice
+from billing_engine.models import Invoice, Customer, Plan, PricingType, BillingPeriod, Subscription, SubscriptionStatus, LedgerDirection
+from billing_engine.money import Money
+from billing_engine.db import Database
+from billing_engine.billing.cycle import BillingCycle
+from billing_engine.billing.dunning import DunningProcess, DunningState
+from billing_engine.payments.gateway import ScriptedGateway, PaymentResult
 
 
 def format_invoice_text(invoice: Invoice, customer_name: str, plan_name: str) -> str:
     """Render an invoice as a plain-text receipt. Pure function — easy to test."""
-    # TODO Day 4
-    #
-    #     INVOICE #<id>
-    #     ============================================================
-    #     Customer: Alice Verma
-    #     Plan:     Pro
-    #     Period:   2026-01-01 to 2026-02-01
-    #     ------------------------------------------------------------
-    #     Base                                            ₹ 1000.00
-    #     Discount (10%)                                  ₹  -100.00
-    #     CGST (9%)                                       ₹    81.00
-    #     SGST (9%)                                       ₹    81.00
-    #     ------------------------------------------------------------
-    #     TOTAL                                           ₹  1062.00
-    #     Status: ISSUED
-    #
-    # Use invoice.line_items, invoice.total, invoice.status, invoice.period_start/end.
-    raise NotImplementedError("Day 4: implement format_invoice_text")
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"INVOICE INV-{invoice.id}".center(60))
+    lines.append("=" * 60)
+    lines.append(f"Customer: {customer_name}")
+    lines.append(f"Plan:     {plan_name}")
+    lines.append(f"Period:   {invoice.period_start} → {invoice.period_end}")
+    lines.append("-" * 60)
+    
+    # Line items
+    for item in invoice.line_items:
+        desc = f"{item.kind.value}: {item.description}" if item.kind else item.description
+        amt = f"{item.amount.amount:.2f} {item.amount.currency}"
+        # Right-align amount
+        lines.append(f"{desc:<40} {amt:>15}")
+    
+    lines.append("-" * 60)
+    lines.append(f"{'Subtotal:':<40} {invoice.subtotal.amount:>14.2f} {invoice.subtotal.currency}")
+    if invoice.discount_total.amount > 0:
+        lines.append(f"{'Discount:':<40} {-invoice.discount_total.amount:>14.2f} {invoice.discount_total.currency}")
+    if invoice.tax_total.amount > 0:
+        lines.append(f"{'Tax:':<40} {invoice.tax_total.amount:>14.2f} {invoice.tax_total.currency}")
+    lines.append("-" * 60)
+    lines.append(f"{'TOTAL:':<40} {invoice.total.amount:>14.2f} {invoice.total.currency}")
+    lines.append(f"Status: {invoice.status.value}")
+    lines.append("=" * 60)
+    
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,8 +85,131 @@ def run_demo() -> int:
     Should mirror `tests/test_demo_scenario.py::TestEndToEndScenario::test_full_lifecycle`
     and print a human-readable summary to stdout.
     """
-    # TODO Day 4
-    raise NotImplementedError("Day 4: implement run_demo")
+    import tempfile
+    import os
+    from tests.conftest import (
+        make_flat_strategy_factory, make_discount_factory, make_no_tax_factory,
+    )
+    
+    print("\n" + "=" * 60)
+    print("BILLING ENGINE DEMO".center(60))
+    print("=" * 60 + "\n")
+    
+    # Initialize database (file-backed for proper connection handling)
+    print("1. Initializing database...")
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db = Database(db_path)
+    db.init_schema()
+    from billing_engine.db.repository import (
+        CustomerRepository, PlanRepository, SubscriptionRepository,
+        UsageRecordRepository, InvoiceRepository, InvoiceLineItemRepository,
+        LedgerRepository, PaymentAttemptRepository,
+    )
+    customers = CustomerRepository(db)
+    plans = PlanRepository(db)
+    subscriptions = SubscriptionRepository(db)
+    usage = UsageRecordRepository(db)
+    invoices = InvoiceRepository(db)
+    line_items = InvoiceLineItemRepository(db)
+    ledger = LedgerRepository(db)
+    attempts = PaymentAttemptRepository(db)
+    
+    # Create customer
+    print("2. Creating customer...")
+    cust = customers.add(Customer(None, "Alice Smith", "alice@example.com", "IN", "KA"))
+    print(f"   ✓ Customer created: {cust.name} ({cust.email})")
+    
+    # Create plan
+    print("3. Creating plan...")
+    plan = plans.add(Plan(
+        None, "Pro", PricingType.FLAT, BillingPeriod.MONTHLY, "INR",
+    ))
+    print(f"   ✓ Plan created: {plan.name}")
+    
+    # Create subscription
+    print("4. Creating subscription...")
+    sub = subscriptions.add(Subscription(
+        None, cust.id, plan.id, SubscriptionStatus.ACTIVE,
+        date(2026, 1, 1), date(2026, 2, 1),
+    ))
+    print(f"   ✓ Subscription created (period: {sub.current_period_start} → {sub.current_period_end})")
+    
+    # Run billing cycle
+    print("5. Running billing cycle...")
+    cycle = BillingCycle(
+        db=db,
+        customer_repo=customers,
+        plan_repo=plans,
+        subscription_repo=subscriptions,
+        usage_repo=usage,
+        invoice_repo=invoices,
+        line_item_repo=line_items,
+        ledger_repo=ledger,
+        strategy_factory=make_flat_strategy_factory({"Pro": Money("1000", "INR")}),
+        discount_factory=make_discount_factory({}),
+        tax_factory=make_no_tax_factory(),
+    )
+    result = cycle.run(as_of=date(2026, 2, 1))
+    print(f"   ✓ Billing cycle complete: {result.invoices_created} invoice(s) created")
+    
+    # Check subscription period advanced
+    sub_after = subscriptions.get(sub.id)
+    print(f"   ✓ Subscription period advanced: {sub_after.current_period_start} → {sub_after.current_period_end}")
+    
+    # Check ledger
+    print("6. Checking ledger...")
+    ledger_entries = ledger.list_for_customer(cust.id)
+    print(f"   ✓ Ledger entries: {len(ledger_entries)}")
+    for entry in ledger_entries:
+        direction_str = "DEBIT " if entry.direction == LedgerDirection.DEBIT else "CREDIT"
+        print(f"      {direction_str}: {entry.amount.amount} {entry.amount.currency}")
+    
+    # Get invoice and process payment
+    print("7. Processing payment...")
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM invoices WHERE subscription_id=?", (sub.id,)
+        ).fetchone()
+    invoice = invoices.get(row["id"])
+    print(f"   ✓ Invoice {invoice.id} status: {invoice.status.value}")
+    
+    dunning = DunningProcess(
+        gateway=ScriptedGateway([PaymentResult(True)]),
+        invoice_repo=invoices,
+        ledger_repo=ledger,
+        subscription_repo=subscriptions,
+        attempt_repo=attempts,
+    )
+    outcome = dunning.attempt(invoice, cust.id, datetime(2026, 2, 1, 10, 0))
+    print(f"   ✓ Payment attempt: {outcome.state.value}")
+    
+    # Verify payment posted
+    invoice_paid = invoices.get(invoice.id)
+    print(f"   ✓ Invoice now: {invoice_paid.status.value}")
+    
+    # Final ledger check
+    print("8. Final ledger state...")
+    final_entries = ledger.list_for_customer(cust.id)
+    print(f"   ✓ Total ledger entries: {len(final_entries)}")
+    net_balance = sum(
+        (e.amount.amount if e.direction == LedgerDirection.DEBIT else -e.amount.amount)
+        for e in final_entries
+    )
+    print(f"   ✓ Net balance: {net_balance} INR")
+    
+    print("\n" + "=" * 60)
+    print("DEMO COMPLETE".center(60))
+    print("=" * 60 + "\n")
+    
+    # Cleanup
+    try:
+        from pathlib import Path
+        Path(db_path).unlink()
+    except Exception:
+        pass
+    
+    return 0
 
 
 if __name__ == "__main__":
