@@ -431,6 +431,8 @@ class InvoiceRepository:
     def count_for_subscription(self, subscription_id: int) -> int:
         with self.db.connect() as conn:
             return q.count_invoices_for_subscription(conn, subscription_id)
+        with self.db.connect() as conn:
+            return q.count_invoices_for_subscription(conn, subscription_id)
 
     def mark_paid(self, invoice_id: int) -> None:
         with self.db.transaction() as conn:
@@ -522,8 +524,41 @@ class LedgerRepository:
             reason=entry.reason,
             created_at=entry.created_at,
         )
+        with self.db.transaction() as conn:
+            new_id = q.insert_ledger_entry(
+                conn,
+                entry.invoice_id,
+                entry.customer_id,
+                entry.amount.to_storage(),
+                entry.amount.currency,
+                entry.direction.value,
+                entry.reason,
+            )
+        return LedgerEntry(
+            id=new_id,
+            invoice_id=entry.invoice_id,
+            customer_id=entry.customer_id,
+            amount=entry.amount,
+            direction=entry.direction,
+            reason=entry.reason,
+            created_at=entry.created_at,
+        )
 
     def list_for_customer(self, customer_id: int) -> list[LedgerEntry]:
+        with self.db.connect() as conn:
+            rows = q.select_ledger_for_customer(conn, customer_id)
+        return [
+            LedgerEntry(
+                id=row["id"],
+                invoice_id=row["invoice_id"],
+                customer_id=row["customer_id"],
+                amount=Money(row["amount"], row["currency"]),
+                direction=LedgerDirection(row["direction"]),
+                reason=row["reason"],
+                created_at=_parse_datetime(row["created_at"]),
+            )
+            for row in rows
+        ]
         with self.db.connect() as conn:
             rows = q.select_ledger_for_customer(conn, customer_id)
         return [
@@ -578,12 +613,26 @@ class PaymentAttemptRepository:
                 failure_reason,
                 next_retry_at.isoformat() if next_retry_at else None,
             )
+        with self.db.transaction() as conn:
+            return q.insert_payment_attempt(
+                conn,
+                invoice_id,
+                attempt_no,
+                status,
+                failure_reason,
+                next_retry_at.isoformat() if next_retry_at else None,
+            )
 
     def list_for_invoice(self, invoice_id: int) -> list[dict]:
         with self.db.connect() as conn:
             rows = q.select_attempts_for_invoice(conn, invoice_id)
         return [dict(row) for row in rows]
+        with self.db.connect() as conn:
+            rows = q.select_attempts_for_invoice(conn, invoice_id)
+        return [dict(row) for row in rows]
 
     def count_for_invoice(self, invoice_id: int) -> int:
+        with self.db.connect() as conn:
+            return q.count_attempts_for_invoice(conn, invoice_id)
         with self.db.connect() as conn:
             return q.count_attempts_for_invoice(conn, invoice_id)
