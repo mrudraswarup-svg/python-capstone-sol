@@ -21,8 +21,10 @@ PDF generation is BONUS: see `billing_engine/pdf/renderer.py`.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 from billing_engine.models import Invoice, Customer, Plan, PricingType, BillingPeriod, Subscription, SubscriptionStatus, LedgerDirection
 from billing_engine.money import Money
@@ -66,16 +68,231 @@ def format_invoice_text(invoice: Invoice, customer_name: str, plan_name: str) ->
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="billing", description="Subscription Billing CLI")
+    parser.add_argument("--db", default="billing.db", help="path to SQLite database file")
     sub = parser.add_subparsers(dest="cmd", required=True)
-
-    # TODO Day 4
 
     sub.add_parser("init", help="initialize the database")
     sub.add_parser("demo", help="run the demo scenario")
-    # TODO Day 4
+
+    # customer add
+    cust_p = sub.add_parser("customer", help="customer commands")
+    cust_sub = cust_p.add_subparsers(dest="customer_cmd", required=True)
+    cust_add = cust_sub.add_parser("add", help="add a new customer")
+    cust_add.add_argument("name")
+    cust_add.add_argument("email")
+    cust_add.add_argument("country", help="ISO-2 country code, e.g. IN")
+    cust_add.add_argument("--state", default="", help="state code, e.g. KA")
+
+    # plan list
+    plan_p = sub.add_parser("plan", help="plan commands")
+    plan_sub = plan_p.add_subparsers(dest="plan_cmd", required=True)
+    plan_sub.add_parser("list", help="list all plans")
+
+    # subscribe
+    sub_p = sub.add_parser("subscribe", help="subscribe a customer to a plan")
+    sub_p.add_argument("customer_id", type=int)
+    sub_p.add_argument("plan_id", type=int)
+    sub_p.add_argument("--trial-days", type=int, default=0, dest="trial_days")
+    sub_p.add_argument("--discount", default=None, help="discount code")
+
+    # bill run
+    bill_p = sub.add_parser("bill", help="billing commands")
+    bill_sub = bill_p.add_subparsers(dest="bill_cmd", required=True)
+    bill_run = bill_sub.add_parser("run", help="run the billing cycle")
+    bill_run.add_argument("--date", default=None, help="billing date YYYY-MM-DD (default: today)")
+
+    # invoice show
+    inv_p = sub.add_parser("invoice", help="invoice commands")
+    inv_sub = inv_p.add_subparsers(dest="invoice_cmd", required=True)
+    inv_show = inv_sub.add_parser("show", help="show an invoice as plain text")
+    inv_show.add_argument("invoice_id", type=int)
+
+    # upgrade (stretch)
+    upg_p = sub.add_parser("upgrade", help="upgrade subscription mid-cycle")
+    upg_p.add_argument("subscription_id", type=int)
+    upg_p.add_argument("new_plan_id", type=int)
+    upg_p.add_argument("--date", default=None, help="switch date YYYY-MM-DD (default: today)")
 
     args = parser.parse_args(argv)
-    print(f"TODO: implement command '{args.cmd}'", file=sys.stderr)
+
+    if args.cmd == "init":
+        db = Database(args.db)
+        db.init_schema()
+        print(f"Database initialized: {args.db}")
+        return 0
+
+    if args.cmd == "demo":
+        return run_demo()
+
+    db = Database(args.db)
+    return _dispatch(args, db)
+
+
+def _make_strategy_factory():
+    from billing_engine.pricing.flat import FlatRate
+    from billing_engine.pricing.usage import UsageBased
+
+    def factory(plan):
+        config = json.loads(plan.config_json) if plan.config_json and plan.config_json != "{}" else {}
+        if plan.pricing_type == PricingType.USAGE:
+            return UsageBased(Money(config.get("unit_price", "0"), plan.currency))
+        return FlatRate(Money(config.get("amount", "0"), plan.currency))
+
+    return factory
+
+
+def _make_discount_factory(discount_repo):
+    from billing_engine.discounts.percentage import PercentageDiscount
+    from billing_engine.discounts.fixed import FixedAmountDiscount
+    from billing_engine.discounts.first_month_free import FirstMonthFree
+
+    def factory(discount_id):
+        if discount_id is None:
+            return None
+        row = discount_repo.get_by_code(str(discount_id))
+        if row is None:
+            return None
+        if row["discount_type"] == "PERCENT":
+            return PercentageDiscount(Decimal(row["value"]))
+        if row["discount_type"] == "FIXED":
+            return FixedAmountDiscount(Money(row["value"], row["currency"]))
+        if row["discount_type"] == "FIRST_MONTH_FREE":
+            return FirstMonthFree()
+        return None
+
+    return factory
+
+
+def _make_tax_factory():
+    from billing_engine.taxes.base import TaxCalculator, TaxContext
+
+    def factory(customer):
+        calc = TaxCalculator.for_country(customer.country_code)
+        ctx = TaxContext(customer_country=customer.country_code, customer_state=customer.state_code or "")
+        return calc, ctx
+
+    return factory
+
+
+def _dispatch(args, db) -> int:
+    from billing_engine.db.repository import (
+        CustomerRepository, PlanRepository, SubscriptionRepository,
+        UsageRecordRepository, InvoiceRepository, InvoiceLineItemRepository,
+        LedgerRepository, PaymentAttemptRepository, DiscountRepository,
+    )
+
+    customers = CustomerRepository(db)
+    plans = PlanRepository(db)
+    subscriptions = SubscriptionRepository(db)
+    usage = UsageRecordRepository(db)
+    invoices = InvoiceRepository(db)
+    line_items = InvoiceLineItemRepository(db)
+    ledger = LedgerRepository(db)
+    attempts = PaymentAttemptRepository(db)
+    discounts = DiscountRepository(db)
+
+    if args.cmd == "customer" and args.customer_cmd == "add":
+        cust = customers.add(Customer(None, args.name, args.email, args.country, args.state))
+        print(f"Customer added: id={cust.id}  name={cust.name}  email={cust.email}")
+        return 0
+
+    if args.cmd == "plan" and args.plan_cmd == "list":
+        all_plans = plans.list_all()
+        if not all_plans:
+            print("No plans found.")
+        for plan in all_plans:
+            print(f"id={plan.id}  {plan.name:<20}  {plan.pricing_type.value:<10}  {plan.billing_period.value:<8}  {plan.currency}")
+        return 0
+
+    if args.cmd == "subscribe":
+        plan = plans.get(args.plan_id)
+        if plan is None:
+            print(f"Plan {args.plan_id} not found.", file=sys.stderr)
+            return 1
+        start = date.today()
+        if plan.billing_period == BillingPeriod.MONTHLY:
+            m = start.month % 12 + 1
+            y = start.year + (1 if start.month == 12 else 0)
+            import calendar
+            end = date(y, m, min(start.day, calendar.monthrange(y, m)[1]))
+        else:
+            import calendar
+            y = start.year + 1
+            end = date(y, start.month, min(start.day, calendar.monthrange(y, start.month)[1]))
+        trial_end = (start + timedelta(days=args.trial_days)) if args.trial_days > 0 else None
+        status = SubscriptionStatus.TRIAL if trial_end else SubscriptionStatus.ACTIVE
+
+        # Resolve discount code to id
+        discount_id = None
+        if args.discount:
+            row = discounts.get_by_code(args.discount)
+            if row is None:
+                print(f"Discount code '{args.discount}' not found.", file=sys.stderr)
+                return 1
+            discount_id = row["id"]
+
+        sub = subscriptions.add(Subscription(
+            None, args.customer_id, args.plan_id, status, start, end,
+            trial_end=trial_end, discount_id=discount_id,
+        ))
+        print(f"Subscription created: id={sub.id}  status={sub.status.value}  period={sub.current_period_start} → {sub.current_period_end}")
+        return 0
+
+    if args.cmd == "bill" and args.bill_cmd == "run":
+        as_of = date.fromisoformat(args.date) if args.date else date.today()
+        cycle = BillingCycle(
+            db=db,
+            customer_repo=customers,
+            plan_repo=plans,
+            subscription_repo=subscriptions,
+            usage_repo=usage,
+            invoice_repo=invoices,
+            line_item_repo=line_items,
+            ledger_repo=ledger,
+            strategy_factory=_make_strategy_factory(),
+            discount_factory=_make_discount_factory(discounts),
+            tax_factory=_make_tax_factory(),
+        )
+        result = cycle.run(as_of=as_of)
+        print(f"Billing cycle complete as of {as_of}: {result.invoices_created} created, "
+              f"{result.invoices_skipped_duplicate} skipped, {result.trials_activated} trials activated.")
+        return 0
+
+    if args.cmd == "invoice" and args.invoice_cmd == "show":
+        invoice = invoices.get(args.invoice_id)
+        if invoice is None:
+            print(f"Invoice {args.invoice_id} not found.", file=sys.stderr)
+            return 1
+        # Fetch line items
+        line_item_list = line_items.list_for_invoice(invoice.id)
+        invoice.line_items.extend(line_item_list)
+        # Resolve customer and plan names via subscription
+        sub = subscriptions.get(invoice.subscription_id)
+        customer_name = customers.get(sub.customer_id).name if sub else "Unknown"
+        plan_name = plans.get(sub.plan_id).name if sub else "Unknown"
+        print(format_invoice_text(invoice, customer_name, plan_name))
+        return 0
+
+    if args.cmd == "upgrade":
+        switch_date = date.fromisoformat(args.date) if args.date else date.today()
+        cycle = BillingCycle(
+            db=db,
+            customer_repo=customers,
+            plan_repo=plans,
+            subscription_repo=subscriptions,
+            usage_repo=usage,
+            invoice_repo=invoices,
+            line_item_repo=line_items,
+            ledger_repo=ledger,
+            strategy_factory=_make_strategy_factory(),
+            discount_factory=_make_discount_factory(discounts),
+            tax_factory=_make_tax_factory(),
+        )
+        cycle.upgrade_subscription(args.subscription_id, args.new_plan_id, switch_date)
+        print(f"Subscription {args.subscription_id} upgraded to plan {args.new_plan_id} on {switch_date}.")
+        return 0
+
+    print(f"Unknown command '{args.cmd}'", file=sys.stderr)
     return 2
 
 
