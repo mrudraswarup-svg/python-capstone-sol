@@ -202,63 +202,57 @@ class BillingCycle:
         old_plan = self.plan_repo.get(sub.plan_id)
         new_plan = self.plan_repo.get(new_plan_id)
         customer = self.customer_repo.get(sub.customer_id)
-        
-        # Compute old and new plan prices
+
+        # Compute old and new plan prices (pure — no DB needed)
         old_strategy = self.strategy_factory(old_plan)
         new_strategy = self.strategy_factory(new_plan)
-        old_price = old_strategy.calculate(0)  # Flat plans don't need usage
+        old_price = old_strategy.calculate(0)
         new_price = new_strategy.calculate(0)
-        
-        # Call compute_proration()
+
         tax_calc, tax_context = self.tax_factory(customer)
         pr = compute_proration(
             old_price, new_price,
             sub.current_period_start, sub.current_period_end, switch_date,
             tax_calc, tax_context,
         )
-        
-        # Create a proration invoice
-        with self.db.transaction() as conn:
-            invoice = Invoice(
-                id=None,
-                subscription_id=subscription_id,
-                period_start=sub.current_period_start,
-                period_end=sub.current_period_end,
-                subtotal=pr.credit_amount + pr.charge_amount,
-                discount_total=Money("0", old_plan.currency),
-                tax_total=pr.credit_tax + pr.charge_tax,
-                total=(pr.credit_amount + pr.charge_amount) + (pr.credit_tax + pr.charge_tax),
-                status=InvoiceStatus.ISSUED,
-            )
-            saved_invoice = self.invoice_repo.add(invoice)
-            
-            # Add credit line item
-            self.line_item_repo.add(InvoiceLineItem(
-                id=None,
-                invoice_id=saved_invoice.id,
-                description=f"Credit for {old_plan.name}",
-                amount=pr.credit_amount * -1,  # Negative for credit
-                kind=LineItemKind.PRORATION_CREDIT,
-            ))
-            
-            # Add charge line item
-            self.line_item_repo.add(InvoiceLineItem(
-                id=None,
-                invoice_id=saved_invoice.id,
-                description=f"Charge for {new_plan.name}",
-                amount=pr.charge_amount,
-                kind=LineItemKind.PRORATION_CHARGE,
-            ))
-            
-            # Post matching ledger debit
-            self.ledger_repo.add(LedgerEntry(
-                id=None,
-                invoice_id=saved_invoice.id,
-                customer_id=sub.customer_id,
-                amount=saved_invoice.total,
-                direction=LedgerDirection.DEBIT,
-                reason=f"Proration: upgrade from {old_plan.name} to {new_plan.name}",
-            ))
-            
-            # Switch subscription to new plan
-            self.subscription_repo.update_plan(subscription_id, new_plan_id)
+
+        # Persist the proration invoice (each repo call owns its own transaction)
+        invoice = Invoice(
+            id=None,
+            subscription_id=subscription_id,
+            period_start=sub.current_period_start,
+            period_end=sub.current_period_end,
+            subtotal=pr.credit_amount + pr.charge_amount,
+            discount_total=Money("0", old_plan.currency),
+            tax_total=pr.credit_tax + pr.charge_tax,
+            total=(pr.credit_amount + pr.charge_amount) + (pr.credit_tax + pr.charge_tax),
+            status=InvoiceStatus.ISSUED,
+        )
+        saved_invoice = self.invoice_repo.add(invoice)
+
+        self.line_item_repo.add(InvoiceLineItem(
+            id=None,
+            invoice_id=saved_invoice.id,
+            description=f"Credit for {old_plan.name}",
+            amount=-pr.credit_amount,
+            kind=LineItemKind.PRORATION_CREDIT,
+        ))
+
+        self.line_item_repo.add(InvoiceLineItem(
+            id=None,
+            invoice_id=saved_invoice.id,
+            description=f"Charge for {new_plan.name}",
+            amount=pr.charge_amount,
+            kind=LineItemKind.PRORATION_CHARGE,
+        ))
+
+        self.ledger_repo.add(LedgerEntry(
+            id=None,
+            invoice_id=saved_invoice.id,
+            customer_id=sub.customer_id,
+            amount=saved_invoice.total,
+            direction=LedgerDirection.DEBIT,
+            reason=f"Proration: upgrade from {old_plan.name} to {new_plan.name}",
+        ))
+
+        self.subscription_repo.update_plan(subscription_id, new_plan_id)
